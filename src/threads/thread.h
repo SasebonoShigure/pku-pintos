@@ -4,7 +4,7 @@
 #include <debug.h>
 #include <list.h>
 #include <stdint.h>
-
+#include "threads/fixed-point.h"
 /** States in a thread's life cycle. */
 enum thread_status
   {
@@ -88,10 +88,16 @@ struct thread
     char name[16];                      /**< Name (for debugging purposes). */
     uint8_t *stack;                     /**< Saved stack pointer. */
     int priority;                       /**< Priority. */
+    int base_priority;                  /**< 接受捐献时存储原来的优先级 */
     struct list_elem allelem;           /**< List element for all threads list. */
 
     /* Shared between thread.c and synch.c. */
     struct list_elem elem;              /**< List element. */
+    struct list lock_list;              /**< 当前线程持有的锁的list */
+    struct lock* lock_waiting;          /**< 当前线程等待的锁 */
+    int donation;                       /**< 接受的最高的donation */
+    int nice;
+    fp recent_cpu;
 
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
@@ -106,6 +112,8 @@ struct thread
    If true, use multi-level feedback queue scheduler.
    Controlled by kernel command-line option "-o mlfqs". */
 extern bool thread_mlfqs;
+
+struct list ready_list;
 
 void thread_init (void);
 void thread_start (void);
@@ -138,4 +146,7 @@ void thread_set_nice (int);
 int thread_get_recent_cpu (void);
 int thread_get_load_avg (void);
 
+bool thread_priority_great(const struct list_elem *left, 
+                           const struct list_elem *right, 
+                           void* aux);
 #endif /**< threads/thread.h */

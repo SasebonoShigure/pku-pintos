@@ -7,6 +7,8 @@
 #include "threads/interrupt.h"
 #include "threads/synch.h"
 #include "threads/thread.h"
+#include "threads/malloc.h"
+#include <list.h>
   
 /** See [8254] for hardware details of the 8254 timer chip. */
 
@@ -18,7 +20,7 @@
 #endif
 
 /** Number of timer ticks since OS booted. */
-static int64_t ticks;
+int64_t ticks;
 
 /** Number of loops per timer tick.
    Initialized by timer_calibrate(). */
@@ -30,6 +32,18 @@ static void busy_wait (int64_t loops);
 static void real_time_sleep (int64_t num, int32_t denom);
 static void real_time_delay (int64_t num, int32_t denom);
 
+/* list of sleeping threads*/
+static struct list sleep_list;
+/* 从sleep_list中remove的条目，需要在非intr_context中free */
+static struct list free_list;
+
+/* entry of sleeping threads list*/
+struct sleep_list_entry {
+  struct list_elem node;
+  struct thread* t;
+  int64_t ticks_left;
+};
+
 /** Sets up the timer to interrupt TIMER_FREQ times per second,
    and registers the corresponding interrupt. */
 void
@@ -37,6 +51,10 @@ timer_init (void)
 {
   pit_configure_channel (0, 2, TIMER_FREQ);
   intr_register_ext (0x20, timer_interrupt, "8254 Timer");
+  // 初始化sleep_list
+  list_init(&sleep_list);
+  // 初始化free_list
+  list_init(&free_list);
 }
 
 /** Calibrates loops_per_tick, used to implement brief delays. */
@@ -89,11 +107,65 @@ timer_elapsed (int64_t then)
 void
 timer_sleep (int64_t ticks) 
 {
-  int64_t start = timer_ticks ();
+  if (ticks < 0)
+  {
+    return;
+  }
+  struct sleep_list_entry* entry;
+  enum intr_level old_level = intr_disable();
+  
+  // free free_list中的entry
+  struct list_elem* node = list_begin(&free_list);
+  struct list_elem* end = list_end(&free_list);
+  while (node != end)
+  {
+    entry = list_entry(node, struct sleep_list_entry, node);
+    node = list_remove(node);
+    free(entry);
+  }
 
-  ASSERT (intr_get_level () == INTR_ON);
-  while (timer_elapsed (start) < ticks) 
-    thread_yield ();
+  // 最开始想法：malloc 在 sleep_list_update 中 free，后来发现行不通
+  entry = (struct sleep_list_entry*)malloc(sizeof(struct sleep_list_entry));
+  entry->t = thread_current();
+  entry->ticks_left = ticks;
+  list_push_back(&sleep_list, &entry->node);
+  thread_block();
+
+
+  intr_set_level(old_level);
+}
+
+/** 更新sleep_list，减少每个entry的剩余睡觉时间，对到时间的unblock */
+static void sleep_list_update (void)
+{
+  struct sleep_list_entry* entry;
+  struct list_elem* node = list_begin(&sleep_list);
+  struct list_elem* end = list_end(&sleep_list);
+  while (node != end)
+  {
+    entry = list_entry(node, struct sleep_list_entry, node);
+    (entry->ticks_left)--;
+    if (entry->ticks_left <= 0)
+    {
+      node = list_remove(node);
+
+
+      thread_unblock(entry->t);
+      // free需要调用lock_acquire，后者不能在intr_context调用
+      // 插入到free_list里，日后再free
+      list_push_back(&free_list, &entry->node);
+      // 更新readylist后需要reschedule
+      if (entry->t->priority > thread_current()->priority) 
+      {
+        intr_yield_on_return();
+      }
+    }
+    else
+    {
+      node = list_next(node);
+    }
+  }
+
 }
 
 /** Sleeps for approximately MS milliseconds.  Interrupts must be
@@ -171,6 +243,7 @@ static void
 timer_interrupt (struct intr_frame *args UNUSED)
 {
   ticks++;
+  sleep_list_update();
   thread_tick ();
 }
 
