@@ -134,6 +134,36 @@ pintos_init (void)
     run_actions (argv);
   } else {
     // TODO: no command line passed to kernel. Run interactively 
+    int buffer_size = 256;
+    int i;
+    char c;
+    char* buffer = malloc(buffer_size); // 输入buffer
+    while (true) {
+      memset(buffer, '\0', buffer_size);
+      printf("PKUOS>");
+      for (i = 0; i < buffer_size - 1; i++) { // 避免buffer溢出
+        c = input_getc();
+        if (c == '\r') { // 换行
+          printf("\n");
+          break;
+        }
+        else {
+          buffer[i] = c;
+          printf("%c", c);
+        }
+      }
+      if (strcmp(buffer, "whoami") == 0) {
+        printf("your student ID\n");
+      }
+      else if (strcmp(buffer, "exit") == 0) {
+        break;
+      }
+      else {
+        printf("shell: %s: command not found\n", buffer);
+      }
+    }
+    free(buffer);
+
   }
 
   /* Finish up. */
