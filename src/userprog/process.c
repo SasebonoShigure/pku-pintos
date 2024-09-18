@@ -17,9 +17,80 @@
 #include "threads/palloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include "threads/malloc.h"
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
+bool fd_less(const struct list_elem *left, 
+             const struct list_elem *right, 
+             void* aux);
+
+int get_new_fd(void);
+struct file_list_entry* fd_to_fle(int fd);
+
+/* 为进程死亡做准备 */
+void process_funeral()
+{
+  struct thread* t = thread_current();
+  // 处理child_list的cwp
+  struct list_elem *e;
+  struct list_elem *enext;
+  struct comm_with_parent* cwp;
+
+  lock_acquire(&cwp_lock);
+  e = list_begin(&t->child_list);
+  while (e != list_end(&t->child_list))
+  {
+    enext = list_next(e);
+    cwp = list_entry(e, struct comm_with_parent, elem);
+    // 子进程还活着，要把它的cwp设为NULL
+    if (cwp->t != NULL)
+    {
+      cwp->t->cwp = NULL;
+    }
+    free(cwp);
+    e = enext;
+  }
+  lock_release(&cwp_lock);
+
+  // 处理自己的cwp
+  lock_acquire(&cwp_lock);
+  // 父进程还在
+  if (t->cwp != NULL)
+  {
+    ASSERT (t->cwp->parent != NULL);
+    t->cwp->t = NULL;
+    t->cwp->exit_code = t->exit_code;
+    sema_up(&t->cwp->sema_wait);
+  }
+  else
+  {
+    // 父进程死了
+    free(t->cwp);
+  }
+  lock_release(&cwp_lock);
+  // 关闭所有文件
+  struct file_list_entry* fle;
+  int fd;
+  while(!list_empty(&t->file_list))
+  {
+    fd = list_entry(list_front(&t->file_list), 
+                    struct file_list_entry, elem)->fd;
+    fle = fd_to_fle(fd);
+    if (fle != NULL)
+    {
+      lock_acquire(&filesys_lock);
+      file_close(fle->f);
+      lock_release(&filesys_lock);
+      list_remove(&fle->elem);
+      free(fle);
+    }
+  }
+  // 关掉自己的executable
+  lock_acquire(&filesys_lock);
+  file_close(t->executable);
+  lock_release(&filesys_lock);
+}
 
 /** Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
@@ -33,15 +104,39 @@ process_execute (const char *file_name)
 
   /* Make a copy of FILE_NAME.
      Otherwise there's a race between the caller and load(). */
-  fn_copy = palloc_get_page (0);
+  fn_copy = (char*)malloc(strlen(file_name) + 1);
   if (fn_copy == NULL)
     return TID_ERROR;
-  strlcpy (fn_copy, file_name, PGSIZE);
 
+  strlcpy (fn_copy, file_name, PGSIZE);
+  char* file_name_copy = (char*)malloc(strlen(file_name) + 1);
+  ASSERT (file_name_copy != NULL);
+  strlcpy (file_name_copy, file_name, PGSIZE);
+  char *save_ptr;
+  char *file_name_without_arg = strtok_r(file_name_copy, " ", &save_ptr);
+  struct thread* t = thread_current();
+  sema_init(&t->sema_execute, 0);
+  t->starting_process = true;
+  t->start_process_success = false;
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
+  tid = thread_create (file_name_without_arg, PRI_DEFAULT, 
+                       start_process, fn_copy);
+  free(file_name_copy);
   if (tid == TID_ERROR)
-    palloc_free_page (fn_copy); 
+  {
+    free(fn_copy); 
+  }
+  else 
+  {
+    // 小心死锁，如果thread_create失败，sema_up不会被调用
+    sema_down(&t->sema_execute);
+  }
+
+  if (!t->start_process_success) 
+  {
+    tid = -1;
+  }
+  t->starting_process = false;
   return tid;
 }
 
@@ -53,19 +148,85 @@ start_process (void *file_name_)
   char *file_name = file_name_;
   struct intr_frame if_;
   bool success;
+  
+  char *save_ptr;
+  // 由于file_name由start_process来free，因此可以随意更改
+  char *arg = strtok_r(file_name, " ", &save_ptr);
 
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
-  success = load (file_name, &if_.eip, &if_.esp);
-
+  lock_acquire(&filesys_lock);
+  success = load (arg, &if_.eip, &if_.esp);
+  lock_release(&filesys_lock);
+  struct thread* t = thread_current();
+  // 在这里访问cwp的时候父进程被block住，不需要cwp_lock
+  struct thread* parent = t->cwp->parent;
   /* If load failed, quit. */
-  palloc_free_page (file_name);
   if (!success) 
+  {
+    // free移到if里面，因为success的时候后面还有用
+    // thread_exit NORETURN，注意顺序
+    free(file_name);
+    sema_up(&parent->sema_execute);
+    thread_current()->exit_code = -1;
     thread_exit ();
+    NOT_REACHED ();
+  }
+  // success
+  parent->start_process_success = true;
+  sema_up(&parent->sema_execute);
+  // 拒绝写入executable的相关操作
+  lock_acquire(&filesys_lock);
+  struct file *f = filesys_open(arg);
+  file_deny_write(f);
+  lock_release(&filesys_lock);
+  thread_current()->executable = f;
+  /* 处理栈 */
+  if_.esp = PHYS_BASE;
+  int argc = 0;
+  char* argv[66]; // 命令行参数最大128 byte，argv数量最多是65
+  for (; arg != NULL; arg = strtok_r (NULL, " ", &save_ptr))
+  {
+    argv[argc] = arg;
+    argc++;
+  }
+  /* argv[i][...] */
+  for (int i = argc - 1; i >= 0; i--)
+  {
+    size_t len = strlen(argv[i]) + 1;
+    if_.esp -= len;
+    strlcpy(if_.esp, argv[i], len);
+    argv[i] = if_.esp;
+  }
+  /* word-align */
+  size_t round = (uint32_t)(if_.esp) % 4;
+  if_.esp -= round;
+  memset(if_.esp, 0, round);
+  /* null pointer sentinel */
+  if_.esp -= sizeof(char*);
+  memset(if_.esp, 0, sizeof(char*));
+  /* argv[i] */
+  for (int i = argc - 1; i >= 0; i--)
+  {
+    if_.esp -= sizeof(char*);
+    *((char**)(if_.esp)) = argv[i];
+  }
+  /* argv */
+  if_.esp -= sizeof(char*);
+  // *((char**)(if_.esp)) = argv[0];
+  *(char***)if_.esp = (char**)(if_.esp + 4);
+  /* argc */
+  if_.esp -= sizeof(int);
+  *((int*)(if_.esp)) = argc;
+  /* return address */
+  if_.esp -= sizeof(uint32_t);
+  *(uint32_t*)(if_.esp) = 0;
 
+
+  free(file_name);
   /* Start the user process by simulating a return from an
      interrupt, implemented by intr_exit (in
      threads/intr-stubs.S).  Because intr_exit takes all of its
@@ -88,7 +249,37 @@ start_process (void *file_name_)
 int
 process_wait (tid_t child_tid UNUSED) 
 {
-  return -1;
+  struct thread* t = thread_current();
+  struct list_elem *e;
+  struct comm_with_parent* cwp;
+  int return_code = -1;
+  for (e = list_begin (&t->child_list); e != list_end (&t->child_list); 
+                       e = list_next (e))
+  {
+    cwp = list_entry(e, struct comm_with_parent, elem);
+    if (cwp->tid == child_tid)
+    {
+      if (cwp->t == NULL)
+      {
+        // 子进程死了
+        return_code = cwp->exit_code;
+        list_remove(e);
+        free(cwp);
+        break;
+      }
+      else
+      {
+        // 没死，等待
+        sema_down(&cwp->sema_wait);
+        return_code = cwp->exit_code;
+        list_remove(e);
+        free(cwp);
+        break;
+      }
+      
+    }
+  }
+  return return_code;
 }
 
 /** Free the current process's resources. */
@@ -97,7 +288,7 @@ process_exit (void)
 {
   struct thread *cur = thread_current ();
   uint32_t *pd;
-
+  printf ("%s: exit(%d)\n", cur->name,cur->exit_code);
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
   pd = cur->pagedir;
@@ -462,4 +653,50 @@ install_page (void *upage, void *kpage, bool writable)
      address, then map our page there. */
   return (pagedir_get_page (t->pagedir, upage) == NULL
           && pagedir_set_page (t->pagedir, upage, kpage, writable));
+}
+
+
+bool fd_less(const struct list_elem *left, 
+             const struct list_elem *right, 
+             void* aux UNUSED)
+{
+  return list_entry(left, struct file_list_entry, elem)->fd < 
+         list_entry(right, struct file_list_entry, elem)->fd;
+}
+
+/** 返回新fd */
+int get_new_fd(void)
+{
+  struct thread* t = thread_current();
+  // 01被保留
+  if (list_empty(&t->file_list))
+  {
+    return 2;
+  }
+  else
+  {
+    struct file_list_entry* fle = list_entry(list_back(&t->file_list), 
+                                             struct file_list_entry, 
+                                             elem);
+    return fle->fd + 1;
+  }
+}
+
+struct file_list_entry* fd_to_fle(int fd)
+{
+  struct thread* t = thread_current();
+  struct file_list_entry* ret = NULL;
+  struct file_list_entry* fle;
+  for (struct list_elem* e = list_begin (&t->file_list); 
+                                         e != list_end (&t->file_list); 
+                                         e = list_next(e))
+  {
+    fle = list_entry(e,struct file_list_entry, elem);
+    if (fle->fd == fd)
+    {
+      ret = fle;
+      break;
+    }
+  }
+  return ret;
 }

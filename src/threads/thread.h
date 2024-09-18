@@ -5,6 +5,8 @@
 #include <list.h>
 #include <stdint.h>
 #include "threads/fixed-point.h"
+#include "threads/synch.h"
+#include "filesys/file.h"
 /** States in a thread's life cycle. */
 enum thread_status
   {
@@ -96,17 +98,50 @@ struct thread
     struct list lock_list;              /**< 当前线程持有的锁的list */
     struct lock* lock_waiting;          /**< 当前线程等待的锁 */
     int donation;                       /**< 接受的最高的donation */
-    int nice;
-    fp recent_cpu;
-
+    int nice;                           /**< nice for mlfqs */
+    fp recent_cpu;                      /**< recent cpu for mlfqs */
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
     uint32_t *pagedir;                  /**< Page directory. */
+    int exit_code;                      /**< exit code */
+    struct list child_list;             /**< list of child */
+    struct comm_with_parent* cwp;       /**< 父子进程互相交流信息的struct, 
+                                             如果从来没有过父进程，为NULL。
+                                             父进程死的时候清理子进程的cwp
+                                             没有父进程的进程死的时候自己清理 */
+    struct semaphore sema_execute;      /**< 用于process execute的semaphore */
+    bool start_process_success;         /**< 子进程是否成功在start_process中load */
+    bool starting_process;              /**< 告诉thread_create是不是在
+                                             starting process */
+    struct lock cwp_lock;               /**< 保护cwp */
+    struct file* executable;            /**< 自己的executable file */
+    struct list file_list;              /**< 打开的文件列表 */
 #endif
 
     /* Owned by thread.c. */
     unsigned magic;                     /**< Detects stack overflow. */
   };
+
+/** userprog中子进程用于和父进程交流的struct */
+struct comm_with_parent 
+  {
+    tid_t tid;                          /**< 子进程tid */
+    struct thread* t;                   /**< 子进程struct thread，
+                                             死亡时设为NULL */
+    struct thread* parent;              /**< 父进程struct thread */
+    int exit_code;                      /**< 子进程exit code */
+    struct semaphore sema_wait;         /**< 用于wait的semaphore */
+    struct list_elem elem;              /**< 用于插入父进程的child_list */
+  };
+
+/** 进程的文件 */
+struct file_list_entry
+  {
+    int fd;                             /**< 文件描述符 */
+    struct file* f;                     /**< file 结构指针 */
+    struct list_elem elem;              /**< 用于插入线程的file_list */
+  };
+
 
 /** If false (default), use round-robin scheduler.
    If true, use multi-level feedback queue scheduler.
@@ -114,6 +149,11 @@ struct thread
 extern bool thread_mlfqs;
 
 struct list ready_list;
+struct list all_list;
+/* 保护cwp系统 */
+struct lock cwp_lock; 
+/* filesys lock */
+struct lock filesys_lock;
 
 void thread_init (void);
 void thread_start (void);

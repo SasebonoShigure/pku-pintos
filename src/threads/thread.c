@@ -13,6 +13,7 @@
 #include "threads/vaddr.h"
 #include "threads/fixed-point.h" 
 #include "devices/timer.h"
+#include "threads/malloc.h"
 #ifdef USERPROG
 #include "userprog/process.h"
 #endif
@@ -28,7 +29,7 @@ struct list ready_list;
 
 /** List of all processes.  Processes are added to this list
    when they are first scheduled and removed when they exit. */
-static struct list all_list;
+struct list all_list;
 
 /** Idle thread. */
 static struct thread *idle_thread;
@@ -137,12 +138,16 @@ thread_init (void)
   lock_init (&tid_lock);
   list_init (&ready_list);
   list_init (&all_list);
+#ifdef USERPROG
+  lock_init (&filesys_lock);
+#endif
 
   /* Set up a thread structure for the running thread. */
   initial_thread = running_thread ();
   init_thread (initial_thread, "main", PRI_DEFAULT);
   initial_thread->status = THREAD_RUNNING;
   initial_thread->tid = allocate_tid ();
+  lock_init(&cwp_lock);
 }
 
 /** Starts preemptive thread scheduling by enabling interrupts.
@@ -267,6 +272,25 @@ thread_create (const char *name, int priority,
   }
   tid = t->tid = allocate_tid ();
 
+  
+#ifdef USERPROG
+  // 以下为只有在新的线程是用户进程的时候才需要做的
+  if (thread_current()->starting_process)
+  {
+    t->cwp = (struct comm_with_parent*)
+             malloc(sizeof(struct comm_with_parent));
+    lock_init(&t->cwp_lock);
+    t->cwp->tid = tid;
+    t->cwp->t = t;
+    t->cwp->parent = thread_current();
+    t->cwp->exit_code = 0;
+    sema_init(&t->cwp->sema_wait, 0);
+    list_push_back(&thread_current()->child_list, &t->cwp->elem);
+  }
+
+#endif
+
+
   /* Stack frame for kernel_thread(). */
   kf = alloc_frame (t, sizeof *kf);
   kf->eip = NULL;
@@ -364,7 +388,7 @@ thread_tid (void)
 }
 
 /** Deschedules the current thread and destroys it.  Never
-   returns to the caller. */
+   returns to the caller. 注意在userprog中调用前处理好后事 */
 void
 thread_exit (void) 
 {
@@ -372,6 +396,7 @@ thread_exit (void)
 
 #ifdef USERPROG
   process_exit ();
+  process_funeral();
 #endif
 
   /* Remove thread from all threads list, set our status to dying,
@@ -588,6 +613,15 @@ init_thread (struct thread *t, const char *name, int priority)
   t->recent_cpu = int_to_fp(0);
   t->magic = THREAD_MAGIC;
 
+#ifdef USERPROG
+  t->cwp = NULL;
+  t->exit_code = 0;
+  list_init(&t->child_list);
+  t->starting_process = false;
+  list_init(&t->file_list);
+  t->executable = NULL;
+#endif
+
   old_level = intr_disable ();
   list_push_back (&all_list, &t->allelem);
   intr_set_level (old_level);
@@ -718,6 +752,7 @@ bool thread_priority_great(const struct list_elem *left,
   return list_entry(left, struct thread, elem)->priority > 
          list_entry(right, struct thread, elem)->priority;
 }
+
 
 /** Offset of `stack' member within `struct thread'.
    Used by switch.S, which can't figure it out on its own. */
