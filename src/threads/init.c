@@ -37,7 +37,7 @@
 #include "filesys/filesys.h"
 #include "filesys/fsutil.h"
 #endif
-
+#include "vm/page.h"
 /** Page directory with kernel mappings only. */
 uint32_t *init_page_dir;
 
@@ -114,7 +114,6 @@ pintos_init (void)
   exception_init ();
   syscall_init ();
 #endif
-
   /* Start thread scheduler and enable interrupts. */
   thread_start ();
   serial_init_queue ();
@@ -127,6 +126,10 @@ pintos_init (void)
   filesys_init (format_filesys);
 #endif
 
+#ifdef VM
+  frame_init();
+  swap_init();
+#endif
   printf ("Boot complete.\n");
   
   if (*argv != NULL) {
@@ -267,7 +270,6 @@ parse_options (char **argv)
       char *save_ptr;
       char *name = strtok_r (*argv, "=", &save_ptr);
       char *value = strtok_r (NULL, "", &save_ptr);
-      
       if (!strcmp (name, "-h"))
         usage ();
       else if (!strcmp (name, "-q"))

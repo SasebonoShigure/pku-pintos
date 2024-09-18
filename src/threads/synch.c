@@ -135,11 +135,12 @@ sema_up (struct semaphore *sema)
   
   intr_set_level (old_level);
   // 不加这个yield，priority-sema过不了，不加INTR_ON，alarm_multiple过不了
+#ifndef VM
   if(!intr_context() && old_level == INTR_ON)
   {
     thread_yield();
   }
-  
+#endif
 }
 
 static void sema_test_helper (void *sema_);
@@ -247,12 +248,14 @@ lock_acquire (struct lock *lock)
       int count = 8;
       struct thread* thread_iter = lock->holder;
       struct lock* lock_iter = thread_iter->lock_waiting;
-      while (is_thread(thread_iter) && lock_iter != NULL && count > 0)
+      while (is_thread(thread_iter) && 
+             lock_iter != NULL && 
+             count > 0 && 
+             lock_iter->holder != NULL)
       {
         lock_iter->priority = thread_iter->priority > 
           lock_iter->priority ? 
             thread_iter->priority : lock_iter->priority;
-
         lock_iter->holder->priority = thread_iter->priority > 
             lock_iter->holder->priority ? 
               thread_iter->priority : lock_iter->holder->priority;

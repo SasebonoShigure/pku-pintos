@@ -7,6 +7,8 @@
 #include "threads/fixed-point.h"
 #include "threads/synch.h"
 #include "filesys/file.h"
+#include "vm/page.h"
+#include <hash.h>
 /** States in a thread's life cycle. */
 enum thread_status
   {
@@ -117,7 +119,13 @@ struct thread
     struct file* executable;            /**< 自己的executable file */
     struct list file_list;              /**< 打开的文件列表 */
 #endif
-
+#ifdef VM
+    struct hash* supplemental_page_table;/**< supplemental_page_table */
+    uint8_t* esp;                        /**< 用户栈的esp，为了stack growth */
+    struct file* VM_executable;          /**< 自己的executable file，
+                                              用于lazy load */
+    struct list mmap_list;               /**< mmap文件的list */
+#endif
     /* Owned by thread.c. */
     unsigned magic;                     /**< Detects stack overflow. */
   };

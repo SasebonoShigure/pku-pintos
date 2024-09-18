@@ -10,6 +10,7 @@
 #include "filesys/filesys.h"
 #include "threads/malloc.h"
 #include "devices/input.h"
+#include "vm/page.h"
 
 static void sys_halt(void);
 static void sys_exit(struct intr_frame *f);
@@ -24,7 +25,10 @@ static void sys_filesize(struct intr_frame *f);
 static void sys_read(struct intr_frame *f);
 static void sys_seek(struct intr_frame *f);
 static void sys_tell(struct intr_frame *f);
-
+#ifdef VM
+static void sys_mmap(struct intr_frame *f);
+static void sys_munmap(struct intr_frame *f);
+#endif
 
 
 static void syscall_handler (struct intr_frame *);
@@ -47,6 +51,9 @@ static void
 syscall_handler (struct intr_frame *f) 
 {
   check_read(f->esp, sizeof(int));
+#ifdef VM
+  thread_current()->esp = f->esp;
+#endif
   int syscall_num = *(int *)f->esp;
   switch (syscall_num)
   {
@@ -89,11 +96,149 @@ syscall_handler (struct intr_frame *f)
     case SYS_TELL:
       sys_tell(f);
       break;
+#ifdef VM
+    case SYS_MMAP:
+      sys_mmap(f);
+      break;
+    case SYS_MUNMAP:
+      sys_munmap(f);
+      break;
+#endif
     default:
       PANIC("invalid syscall");
       break;
   }
 }
+
+#ifdef VM
+
+static void sys_mmap(struct intr_frame *f)
+{
+  check_read(f->esp + sizeof(uint32_t), sizeof(int));
+  int fd = *(int *)(f->esp + sizeof(uint32_t));
+  check_read(f->esp + 2 * sizeof(uint32_t),sizeof(char*));
+  void* upage = *(char **)(f->esp + 2 * sizeof(uint32_t));
+
+  if (upage == NULL || (uint32_t)upage % PGSIZE != 0)
+  {
+    f->eax = -1;
+    return;
+  }
+  if (fd <= 1)
+  {
+    f->eax = -1;
+    return;
+  }
+
+  struct thread* t = thread_current();
+  struct file *file = NULL;
+
+  lock_acquire(&filesys_lock);
+  struct file_list_entry* fle = fd_to_fle(fd);
+  uint32_t file_size;
+  uint32_t offset;
+  if(fle)
+  {
+    ASSERT(fle->f != NULL);
+    file = file_reopen (fle->f);
+  }
+  lock_release(&filesys_lock);
+  if(file == NULL)
+  {
+    f->eax = -1;
+    return;
+  }
+
+  lock_acquire(&filesys_lock);
+  file_size = file_length(file);
+  lock_release(&filesys_lock);
+
+  if(file_size == 0)
+  {
+    f->eax = -1;
+    return;
+  }
+
+  // 不能和已有的upage冲突
+  for (offset = 0; offset < file_size; offset += PGSIZE)
+  {
+    if (spt_lookup(t, (int8_t*)upage + offset) != NULL)
+    {
+      f->eax = -1;
+      return;
+    }
+  }
+
+  uint32_t read_bytes = file_size;
+  uint32_t zero_bytes = (uint32_t)pg_round_up((void*)read_bytes) - read_bytes;
+  uint32_t ofs = 0;
+  
+  while (read_bytes > 0 || zero_bytes > 0)
+  {
+    /* Calculate how to fill this page.
+       We will read PAGE_READ_BYTES bytes from FILE
+       and zero the final PAGE_ZERO_BYTES bytes. */
+    size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
+    size_t page_zero_bytes = PGSIZE - page_read_bytes;
+    void* vaddr = (uint8_t*)upage + ofs;
+    struct supplemental_page_table_entry *spte;
+    
+    spte = (struct supplemental_page_table_entry*)
+           malloc(sizeof(struct supplemental_page_table_entry));
+
+    spte->upage = vaddr;
+    spte->status = LAZY_LOAD;
+    spte->file = file;
+    spte->offset = ofs;
+    spte->read_bytes = page_read_bytes;
+    spte->zero_bytes = page_zero_bytes;
+    spte->writable = true;
+    spte->kpage = NULL;
+    lock_acquire(&frame_lock);
+    if (hash_insert (thread_current()->supplemental_page_table, 
+                     &spte->elem))
+    {
+      PANIC("spt already has entry in load_segment");
+    }
+    lock_release(&frame_lock);
+
+    ofs += PGSIZE;
+    read_bytes -= page_read_bytes;
+    zero_bytes -= page_zero_bytes;
+  }
+
+
+  mmapid id = 0;
+  if (! list_empty(&t->mmap_list))
+  {
+    id = list_entry(list_back(&t->mmap_list), 
+                    struct mmap_list_entry, elem)->id + 1;
+  }
+  
+
+  struct mmap_list_entry *mle = (struct mmap_list_entry*)
+                                malloc(sizeof(struct mmap_list_entry));
+  mle->id = id;
+  mle->file = file;
+  mle->size = file_size;
+  mle->upage = upage;
+  list_push_back (&t->mmap_list, &mle->elem);
+
+  f->eax = id;
+  return;
+}
+
+
+static void sys_munmap(struct intr_frame *f)
+{
+  check_read(f->esp + sizeof(uint32_t), sizeof(int));
+  mmapid id = *(int *)(f->esp + sizeof(uint32_t));
+  lock_acquire(&frame_lock);
+  munmap_id(id);
+  lock_release(&frame_lock);
+}
+
+#endif
 
 static inline void sys_halt()
 {
@@ -124,7 +269,8 @@ static void sys_write(struct intr_frame *f)
   else
   {
     struct file_list_entry* fle = fd_to_fle(fd);
-    if (fle != NULL) {
+    if (fle != NULL)
+    {
       lock_acquire(&filesys_lock);
       f->eax = file_write(fle->f, buf, size);
       lock_release(&filesys_lock);
@@ -271,6 +417,7 @@ static void sys_read(struct intr_frame *f)
       }
     }
   }
+  
 }
 
 static void sys_seek(struct intr_frame *f)

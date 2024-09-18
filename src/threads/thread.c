@@ -287,8 +287,18 @@ thread_create (const char *name, int priority,
     sema_init(&t->cwp->sema_wait, 0);
     list_push_back(&thread_current()->child_list, &t->cwp->elem);
   }
-
+#ifdef VM
+  // 同样，只有在新的线程是用户进程的时候才需要spt
+  if (thread_current()->starting_process)
+  {
+    t->supplemental_page_table = (struct hash*)
+             malloc(sizeof(struct hash));
+    hash_init(t->supplemental_page_table, 
+              spte_hash_func, spte_less_func, NULL);
+  }
 #endif
+#endif
+
 
 
   /* Stack frame for kernel_thread(). */
@@ -393,11 +403,20 @@ void
 thread_exit (void) 
 {
   ASSERT (!intr_context ());
-
+#ifdef VM
+  lock_acquire(&frame_lock);
+  // 先munmap
+  munmap_on_exit();
+  // process_exit会palloc_free_page，
+  // 因此要先从fht里删除对应frame，再palloc_free_page
+  free_frame_on_exit();
+  lock_release(&frame_lock);
+#endif
 #ifdef USERPROG
   process_exit ();
   process_funeral();
 #endif
+
 
   /* Remove thread from all threads list, set our status to dying,
      and schedule another process.  That process will destroy us
@@ -621,7 +640,12 @@ init_thread (struct thread *t, const char *name, int priority)
   list_init(&t->file_list);
   t->executable = NULL;
 #endif
-
+#ifdef VM
+    t->supplemental_page_table = NULL;
+    t->esp = NULL;
+    t->VM_executable = NULL;
+    list_init(&t->mmap_list);
+#endif
   old_level = intr_disable ();
   list_push_back (&all_list, &t->allelem);
   intr_set_level (old_level);
